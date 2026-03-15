@@ -1,0 +1,220 @@
+import shutil
+import time
+from pathlib import Path
+
+import torch
+import whisper
+
+# Formatos suportados para conversão automática
+FORMATOS_ENTRADA = {".ogg", ".mp4", ".m4a", ".wav", ".flac", ".webm", ".wma", ".aac"}
+FORMATO_SAIDA = ".mp3"
+# Extensões consideradas áudio ao listar uma pasta (inclui .mp3)
+EXTENSOES_AUDIO = FORMATOS_ENTRADA | {".mp3"}
+
+MSG_FFMPEG = (
+    "FFmpeg não encontrado. O Whisper e a conversão de áudio dependem do FFmpeg.\n"
+    "Instale e adicione ao PATH: https://ffmpeg.org/download.html\n"
+    "No Windows: baixe em https://www.gyan.dev/ffmpeg/builds/ e extraia a pasta 'bin' no PATH."
+)
+
+
+def ffmpeg_disponivel() -> bool:
+    """Verifica se o FFmpeg está disponível no sistema."""
+    return shutil.which("ffmpeg") is not None
+
+
+def converter_para_mp3(caminho_arquivo: str) -> str:
+    """
+    Converte áudio/vídeo para MP3 se necessário.
+    Retorna o caminho do arquivo MP3 (original ou convertido).
+    """
+    caminho = Path(caminho_arquivo)
+    if not caminho.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {caminho_arquivo}")
+
+    extensao = caminho.suffix.lower()
+    if extensao == ".mp3":
+        return str(caminho.resolve())
+
+    if extensao not in FORMATOS_ENTRADA:
+        raise ValueError(
+            f"Formato '{extensao}' não suportado. "
+            f"Use: {', '.join(FORMATOS_ENTRADA)} ou .mp3"
+        )
+
+    try:
+        from pydub import AudioSegment
+    except ImportError:
+        raise ImportError(
+            "Para conversão automática, instale: pip install pydub\n"
+            "E tenha o FFmpeg instalado no sistema (https://ffmpeg.org)"
+        )
+
+    arquivo_mp3 = caminho.with_suffix(FORMATO_SAIDA)
+    if arquivo_mp3 == caminho:
+        arquivo_mp3 = caminho.parent / f"{caminho.stem}_convertido{FORMATO_SAIDA}"
+
+    print(f"Convertendo {caminho.name} para MP3...")
+    audio = AudioSegment.from_file(str(caminho))
+    audio.export(str(arquivo_mp3), format="mp3", bitrate="192k")
+    print(f"Salvo em: {arquivo_mp3.name}")
+    return str(arquivo_mp3.resolve())
+
+
+def listar_audios_pasta(pasta: str) -> list[Path]:
+    """Retorna lista de arquivos de áudio na pasta, em ordem alfabética por nome."""
+    caminho = Path(pasta)
+    if not caminho.is_dir():
+        raise NotADirectoryError(f"Não é uma pasta: {pasta}")
+    arquivos = [
+        f for f in caminho.iterdir()
+        if f.is_file() and f.suffix.lower() in EXTENSOES_AUDIO
+    ]
+    return sorted(arquivos, key=lambda f: f.name.lower())
+
+
+def _transcrever_para_texto(arquivo_entrada: str, model: whisper.Whisper) -> str:
+    """Converte para MP3 se necessário, transcreve com o modelo e retorna apenas o texto."""
+    arquivo_mp3 = converter_para_mp3(arquivo_entrada)
+    result = model.transcribe(arquivo_mp3)
+    return result["text"].strip()
+
+
+def transcrever_e_salvar(
+    arquivo_entrada: str,
+    saida_txt: str | None = None,
+    model: whisper.Whisper | None = None,
+) -> str:
+    """
+    Transcreve áudio/vídeo e salva o texto em um arquivo .txt.
+    Se model for passado, reutiliza o modelo (útil para transcrever vários arquivos).
+    Retorna o texto transcrito.
+    """
+    caminho_entrada = Path(arquivo_entrada)
+
+    if model is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Dispositivo: {'GPU (CUDA)' if device == 'cuda' else 'CPU'}")
+        print("Carregando modelo Whisper...")
+        model = whisper.load_model("turbo", device=device)
+
+    print(f"Transcrevendo: {caminho_entrada.name}...")
+    texto = _transcrever_para_texto(arquivo_entrada, model)
+
+    if saida_txt is None:
+        saida_txt = str(caminho_entrada.with_suffix(".txt"))
+    if not saida_txt.endswith(".txt"):
+        saida_txt = f"{Path(saida_txt).stem}.txt"
+
+    with open(saida_txt, "w", encoding="utf-8") as f:
+        f.write(texto)
+
+    print(f"Transcrição salva em: {saida_txt}")
+    return texto
+
+
+def transcrever_pasta(
+    pasta: str,
+    saida_unica: str | None = None,
+) -> list[tuple[str, str]]:
+    """
+    Transcreve todos os arquivos de áudio da pasta (ordem alfabética por nome).
+    Se saida_unica for informado, grava todas as transcrições em um único .txt, em ordem.
+    Caso contrário, salva cada uma em .txt no mesmo diretório.
+    Retorna lista de (arquivo_entrada, texto_transcrito).
+    """
+    arquivos = listar_audios_pasta(pasta)
+    if not arquivos:
+        print(f"Nenhum arquivo de áudio encontrado em: {pasta}")
+        return []
+
+    print(f"Encontrados {len(arquivos)} arquivo(s) de áudio (ordem alfabética).")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Dispositivo: {'GPU (CUDA)' if device == 'cuda' else 'CPU'}")
+    print("Carregando modelo Whisper...")
+    model = whisper.load_model("turbo", device=device)
+
+    resultados = []
+    for i, caminho in enumerate(arquivos, 1):
+        print(f"\n[{i}/{len(arquivos)}] ", end="")
+        try:
+            texto = _transcrever_para_texto(str(caminho), model)
+            resultados.append((str(caminho), texto))
+            if saida_unica is None:
+                saida_txt = str(Path(caminho).with_suffix(".txt"))
+                with open(saida_txt, "w", encoding="utf-8") as f:
+                    f.write(texto)
+                print(f"Transcrição salva em: {saida_txt}")
+        except (OSError, ValueError, ImportError) as e:
+            print(f"Erro em {caminho.name}: {e}")
+
+    if saida_unica and resultados:
+        path_saida = Path(saida_unica)
+        if not path_saida.suffix.lower() == ".txt":
+            path_saida = path_saida.with_suffix(".txt")
+        with open(path_saida, "w", encoding="utf-8") as f:
+            for caminho, texto in resultados:
+                nome = Path(caminho).name
+                f.write(f"--- {nome} ---\n\n")
+                f.write(texto)
+                f.write("\n\n")
+        print(f"\nTranscrição única salva em: {path_saida}")
+    return resultados
+
+
+def _formatar_duracao(segundos: float) -> str:
+    """Formata duração em segundos para exibição (ex: '2 min 35 s' ou '45.2 s')."""
+    if segundos < 60:
+        return f"{segundos:.1f} s"
+    mins = int(segundos // 60)
+    secs = segundos % 60
+    if secs < 0.05:
+        return f"{mins} min"
+    return f"{mins} min {secs:.1f} s"
+
+
+if __name__ == "__main__":
+    import sys
+
+    argv = [a for a in sys.argv[1:] if a not in ("--unico", "-u")]
+    unico = len(argv) < len(sys.argv) - 1  # havia --unico ou -u
+
+    arquivo = argv[0] if argv else "audio.mp3"
+    nome_saida = argv[1] if len(argv) > 1 else None
+
+    saida_unica = None
+    if unico:
+        saida_unica = argv[1] if len(argv) > 1 else "transcricao_completa.txt"
+        if not saida_unica.endswith(".txt"):
+            saida_unica = f"{Path(saida_unica).stem}.txt"
+
+    if not ffmpeg_disponivel():
+        print("Aviso: FFmpeg não está no PATH. A transcrição pode falhar.")
+        print(MSG_FFMPEG)
+
+    inicio = time.perf_counter()
+    try:
+        caminho = Path(arquivo)
+        if caminho.is_dir():
+            resultados = transcrever_pasta(arquivo, saida_unica=saida_unica)
+            print(f"\n--- Concluído: {len(resultados)} arquivo(s) transcrito(s) ---")
+        else:
+            if unico:
+                print("Aviso: --unico aplica-se apenas ao transcrever uma pasta; ignorado.")
+            texto = transcrever_e_salvar(arquivo, nome_saida)
+            print("\n--- Transcrição ---")
+            print(texto)
+    except OSError as e:
+        msg = str(e).lower()
+        if (getattr(e, "winerror", None) == 2) or "não pode encontrar" in msg or "cannot find" in msg:
+            print("Erro: arquivo não encontrado (provavelmente FFmpeg).")
+            print(MSG_FFMPEG)
+        else:
+            print(f"Erro: {e}")
+        sys.exit(1)
+    except (ValueError, ImportError, NotADirectoryError) as e:
+        print(f"Erro: {e}")
+        sys.exit(1)
+    finally:
+        duracao = time.perf_counter() - inicio
+        print(f"\nTempo total: {_formatar_duracao(duracao)}")
