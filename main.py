@@ -77,6 +77,12 @@ def _transcrever_para_texto(arquivo_entrada: str, model: whisper.Whisper) -> str
     """Converte para MP3 se necessário, transcreve com o modelo e retorna apenas o texto."""
     arquivo_mp3 = converter_para_mp3(arquivo_entrada)
     result = model.transcribe(arquivo_mp3)
+
+    caminho_mp3 = Path(arquivo_mp3)
+    if caminho_mp3.exists():
+        caminho_mp3.unlink()
+        print(f"MP3 removido após transcrição: {caminho_mp3.name}")
+
     return result["text"].strip()
 
 
