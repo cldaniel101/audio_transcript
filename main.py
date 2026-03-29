@@ -1,5 +1,8 @@
+import os
 import shutil
+import subprocess
 import time
+import zipfile
 from pathlib import Path
 
 import torch
@@ -61,16 +64,72 @@ def converter_para_mp3(caminho_arquivo: str) -> str:
     return str(arquivo_mp3.resolve())
 
 
+def extrair_zip(origem: Path, destino: Path) -> None:
+    destino.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(origem, "r") as zf:
+        zf.extractall(destino)
+
+
+def extrair_rar(origem: Path, destino: Path) -> None:
+    destino.mkdir(parents=True, exist_ok=True)
+    seven = shutil.which("7z") or shutil.which("7za")
+    if seven:
+        subprocess.run(
+            [seven, "x", str(origem), f"-o{destino}{os.sep}", "-y"],
+            check=True,
+        )
+        return
+    unrar = shutil.which("UnRAR") or shutil.which("unrar")
+    if unrar:
+        subprocess.run([unrar, "x", "-o+", str(origem), str(destino) + os.sep], check=True)
+        return
+    try:
+        import rarfile  # type: ignore[import-untyped]
+    except ImportError as e:
+        raise RuntimeError(
+            "Para .rar: instale o 7-Zip (7z no PATH), UnRAR, ou pip install rarfile + ferramenta UnRAR."
+        ) from e
+    with rarfile.RarFile(origem) as rf:
+        rf.extractall(destino)
+
+
+def preparar_caminho_entrada(caminho: Path) -> Path:
+    """
+    Se for .zip ou .rar, extrai para uma pasta com o mesmo nome (sem extensão),
+    ao lado do arquivo, e devolve esse diretório. Caso contrário devolve o próprio caminho.
+    """
+    if caminho.is_dir():
+        return caminho.resolve()
+    if not caminho.is_file():
+        raise FileNotFoundError(f"Não encontrado: {caminho}")
+    caminho = caminho.resolve()
+    suf = caminho.suffix.lower()
+    if suf == ".zip":
+        destino = caminho.parent / caminho.stem
+        destino.mkdir(parents=True, exist_ok=True)
+        print(f"Extraindo ZIP para: {destino}")
+        extrair_zip(caminho, destino)
+        return destino
+    if suf == ".rar":
+        destino = caminho.parent / caminho.stem
+        destino.mkdir(parents=True, exist_ok=True)
+        print(f"Extraindo RAR para: {destino}")
+        extrair_rar(caminho, destino)
+        return destino
+    return caminho
+
+
 def listar_audios_pasta(pasta: str) -> list[Path]:
-    """Retorna lista de arquivos de áudio na pasta, em ordem alfabética por nome."""
+    """Retorna arquivos de áudio na pasta (recursivo), em ordem alfabética pelo caminho."""
     caminho = Path(pasta)
     if not caminho.is_dir():
         raise NotADirectoryError(f"Não é uma pasta: {pasta}")
     arquivos = [
-        f for f in caminho.iterdir()
+        f
+        for f in caminho.rglob("*")
         if f.is_file() and f.suffix.lower() in EXTENSOES_AUDIO
     ]
-    return sorted(arquivos, key=lambda f: f.name.lower())
+    return sorted(arquivos, key=lambda f: str(f).lower())
 
 
 def _transcrever_para_texto(arquivo_entrada: str, model: whisper.Whisper) -> str:
@@ -182,17 +241,14 @@ def _formatar_duracao(segundos: float) -> str:
 if __name__ == "__main__":
     import sys
 
-    argv = [a for a in sys.argv[1:] if a not in ("--unico", "-u")]
-    unico = len(argv) < len(sys.argv) - 1  # havia --unico ou -u
+    argv_rest = [a for a in sys.argv[1:] if a not in ("--unico", "-u")]
+    unico = len(argv_rest) < len(sys.argv[1:])
 
-    arquivo = argv[0] if argv else "audio.mp3"
-    nome_saida = argv[1] if len(argv) > 1 else None
+    entrada_raw = argv_rest[0] if argv_rest else "audio.mp3"
+    segundo_arg = argv_rest[1] if len(argv_rest) > 1 else None
 
-    saida_unica = None
-    if unico:
-        saida_unica = argv[1] if len(argv) > 1 else "transcricao_completa.txt"
-        if not saida_unica.endswith(".txt"):
-            saida_unica = f"{Path(saida_unica).stem}.txt"
+    nome_saida: str | None = None
+    saida_unica: str | None = None
 
     if not ffmpeg_disponivel():
         print("Aviso: FFmpeg não está no PATH. A transcrição pode falhar.")
@@ -200,14 +256,31 @@ if __name__ == "__main__":
 
     inicio = time.perf_counter()
     try:
-        caminho = Path(arquivo)
+        caminho = preparar_caminho_entrada(Path(entrada_raw).expanduser())
+
         if caminho.is_dir():
-            resultados = transcrever_pasta(arquivo, saida_unica=saida_unica)
+            if unico:
+                if segundo_arg:
+                    p = Path(segundo_arg)
+                    if p.is_absolute():
+                        out = p if p.suffix.lower() == ".txt" else p.with_suffix(".txt")
+                        saida_unica = str(out)
+                    else:
+                        nome_txt = (
+                            segundo_arg
+                            if segundo_arg.endswith(".txt")
+                            else f"{Path(segundo_arg).stem}.txt"
+                        )
+                        saida_unica = str(caminho / nome_txt)
+                else:
+                    saida_unica = str(caminho / "transcricao_completa.txt")
+            resultados = transcrever_pasta(str(caminho), saida_unica=saida_unica)
             print(f"\n--- Concluído: {len(resultados)} arquivo(s) transcrito(s) ---")
         else:
+            nome_saida = segundo_arg
             if unico:
                 print("Aviso: --unico aplica-se apenas ao transcrever uma pasta; ignorado.")
-            texto = transcrever_e_salvar(arquivo, nome_saida)
+            texto = transcrever_e_salvar(str(caminho), nome_saida)
             print("\n--- Transcrição ---")
             print(texto)
     except OSError as e:
@@ -218,8 +291,13 @@ if __name__ == "__main__":
         else:
             print(f"Erro: {e}")
         sys.exit(1)
-    except (ValueError, ImportError, NotADirectoryError) as e:
+    except (ValueError, ImportError, NotADirectoryError, RuntimeError) as e:
         print(f"Erro: {e}")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Erro ao extrair arquivo compactado (código {e.returncode}).")
+        if e.stderr:
+            print(e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else e.stderr)
         sys.exit(1)
     finally:
         duracao = time.perf_counter() - inicio
