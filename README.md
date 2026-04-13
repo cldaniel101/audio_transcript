@@ -8,7 +8,7 @@ Criei este projeto para uso pessoal, com foco em praticidade: apontar um arquivo
 
 - Transcreve um único arquivo de áudio para texto.
 - Transcreve todos os arquivos de áudio de uma pasta.
-- Converte automaticamente arquivos suportados para `.mp3` antes da transcrição, quando necessário.
+- Converte automaticamente qualquer arquivo com stream de áudio para `.mp3` antes da transcrição, quando necessário.
 - Salva uma transcrição por arquivo ou junta tudo em um único `.txt`.
 - Usa GPU automaticamente quando o PyTorch com CUDA estiver disponível.
 
@@ -16,15 +16,7 @@ Criei este projeto para uso pessoal, com foco em praticidade: apontar um arquivo
 
 Entrada:
 
-- `.mp3`
-- `.ogg`
-- `.mp4`
-- `.m4a`
-- `.wav`
-- `.flac`
-- `.webm`
-- `.wma`
-- `.aac`
+- Qualquer arquivo que o FFmpeg consiga decodificar e que tenha stream de áudio (incluindo `.opus`, `.ogg`, `.m4a`, `.mp4`, `.wav`, `.flac`, etc.)
 
 Saída:
 
@@ -40,7 +32,7 @@ O script principal está em `main.py`. Ele:
 3. Detecta automaticamente se deve usar `CPU` ou `GPU (CUDA)`.
 4. Salva o texto transcrito em um arquivo `.txt`.
 
-Se a entrada for uma pasta, o script procura todos os arquivos de áudio suportados, ordena em ordem alfabética e transcreve cada um deles.
+Se a entrada for uma pasta, o script detecta os arquivos que possuem stream de áudio, ordena em ordem alfabética e transcreve cada um deles.
 
 ## Requisitos
 
@@ -201,7 +193,7 @@ Há instruções mais detalhadas em `GPU.md`.
 - Não há diarização de falantes.
 - Não há tradução automática no fluxo atual.
 - A qualidade da transcrição depende bastante da clareza do áudio.
-- Arquivos convertidos para `.mp3` são mantidos no diretório; o script não remove esses arquivos depois.
+- Arquivos convertidos para `.mp3` são temporários e removidos após a transcrição.
 
 ## Quando esse projeto é útil
 
@@ -216,7 +208,6 @@ Há instruções mais detalhadas em `GPU.md`.
 - permitir escolher o modelo do Whisper via terminal
 - exportar também em formatos como `.srt`
 - permitir idioma explícito como parâmetro
-- evitar reconversões desnecessárias quando o `.mp3` já existir
 
 ## Licença
 

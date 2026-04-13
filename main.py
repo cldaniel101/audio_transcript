@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -8,12 +9,24 @@ from pathlib import Path
 import torch
 import whisper
 
-# Formatos suportados para conversão automática
-FORMATOS_ENTRADA = {".ogg", ".mp4", ".m4a", ".wav", ".flac", ".webm", ".wma", ".aac"}
 FORMATO_SAIDA = ".mp3"
-# Extensões consideradas áudio ao listar uma pasta (inclui .mp3)
-EXTENSOES_AUDIO = FORMATOS_ENTRADA | {".mp3"}
-
+# Extensoes comuns para filtro rapido; a deteccao final e feita por ffprobe.
+EXTENSOES_AUDIO_COMUNS = {
+    ".mp3",
+    ".opus",
+    ".ogg",
+    ".mp4",
+    ".m4a",
+    ".wav",
+    ".flac",
+    ".webm",
+    ".wma",
+    ".aac",
+    ".amr",
+    ".3gp",
+    ".mkv",
+    ".mov",
+}
 MSG_FFMPEG = (
     "FFmpeg não encontrado. O Whisper e a conversão de áudio dependem do FFmpeg.\n"
     "Instale e adicione ao PATH: https://ffmpeg.org/download.html\n"
@@ -26,24 +39,59 @@ def ffmpeg_disponivel() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def converter_para_mp3(caminho_arquivo: str) -> str:
+def ffprobe_disponivel() -> bool:
+    """Verifica se o ffprobe está disponível no sistema."""
+    return shutil.which("ffprobe") is not None
+
+
+def arquivo_tem_stream_audio(caminho_arquivo: Path) -> bool:
     """
-    Converte áudio/vídeo para MP3 se necessário.
-    Retorna o caminho do arquivo MP3 (original ou convertido).
+    Detecta se o arquivo possui pelo menos um stream de audio.
+    """
+    if not caminho_arquivo.is_file():
+        return False
+    if not ffprobe_disponivel():
+        return caminho_arquivo.suffix.lower() in EXTENSOES_AUDIO_COMUNS
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                str(caminho_arquivo),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except OSError:
+        return caminho_arquivo.suffix.lower() in EXTENSOES_AUDIO_COMUNS
+    except subprocess.TimeoutExpired:
+        return False
+    return proc.returncode == 0 and "audio" in proc.stdout.lower()
+
+
+def converter_para_mp3(caminho_arquivo: str) -> tuple[str, bool]:
+    """
+    Converte qualquer arquivo com stream de audio para MP3.
+    Retorna (caminho_mp3, foi_convertido).
     """
     caminho = Path(caminho_arquivo)
     if not caminho.exists():
         raise FileNotFoundError(f"Arquivo não encontrado: {caminho_arquivo}")
+    if not arquivo_tem_stream_audio(caminho):
+        raise ValueError(f"O arquivo não possui stream de áudio: {caminho.name}")
 
     extensao = caminho.suffix.lower()
     if extensao == ".mp3":
-        return str(caminho.resolve())
-
-    if extensao not in FORMATOS_ENTRADA:
-        raise ValueError(
-            f"Formato '{extensao}' não suportado. "
-            f"Use: {', '.join(FORMATOS_ENTRADA)} ou .mp3"
-        )
+        return str(caminho.resolve()), False
 
     try:
         from pydub import AudioSegment
@@ -53,15 +101,25 @@ def converter_para_mp3(caminho_arquivo: str) -> str:
             "E tenha o FFmpeg instalado no sistema (https://ffmpeg.org)"
         )
 
-    arquivo_mp3 = caminho.with_suffix(FORMATO_SAIDA)
-    if arquivo_mp3 == caminho:
-        arquivo_mp3 = caminho.parent / f"{caminho.stem}_convertido{FORMATO_SAIDA}"
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{caminho.stem}_",
+        suffix=FORMATO_SAIDA,
+        delete=False,
+        dir=str(caminho.parent),
+    ) as tmp:
+        arquivo_mp3 = Path(tmp.name)
 
     print(f"Convertendo {caminho.name} para MP3...")
-    audio = AudioSegment.from_file(str(caminho))
+    try:
+        audio = AudioSegment.from_file(str(caminho))
+    except Exception as e:
+        raise ValueError(
+            f"Não foi possível decodificar '{caminho.name}'. "
+            "Verifique se o arquivo é áudio válido e se o FFmpeg está no PATH."
+        ) from e
     audio.export(str(arquivo_mp3), format="mp3", bitrate="192k")
     print(f"Salvo em: {arquivo_mp3.name}")
-    return str(arquivo_mp3.resolve())
+    return str(arquivo_mp3.resolve()), True
 
 
 def extrair_zip(origem: Path, destino: Path) -> None:
@@ -124,23 +182,20 @@ def listar_audios_pasta(pasta: str) -> list[Path]:
     caminho = Path(pasta)
     if not caminho.is_dir():
         raise NotADirectoryError(f"Não é uma pasta: {pasta}")
-    arquivos = [
-        f
-        for f in caminho.rglob("*")
-        if f.is_file() and f.suffix.lower() in EXTENSOES_AUDIO
-    ]
+    arquivos = [f for f in caminho.rglob("*") if f.is_file() and arquivo_tem_stream_audio(f)]
     return sorted(arquivos, key=lambda f: str(f).lower())
 
 
 def _transcrever_para_texto(arquivo_entrada: str, model: whisper.Whisper) -> str:
     """Converte para MP3 se necessário, transcreve com o modelo e retorna apenas o texto."""
-    arquivo_mp3 = converter_para_mp3(arquivo_entrada)
+    arquivo_mp3, foi_convertido = converter_para_mp3(arquivo_entrada)
     result = model.transcribe(arquivo_mp3)
 
-    caminho_mp3 = Path(arquivo_mp3)
-    if caminho_mp3.exists():
-        caminho_mp3.unlink()
-        print(f"MP3 removido após transcrição: {caminho_mp3.name}")
+    if foi_convertido:
+        caminho_mp3 = Path(arquivo_mp3)
+        if caminho_mp3.exists():
+            caminho_mp3.unlink()
+            print(f"MP3 removido após transcrição: {caminho_mp3.name}")
 
     return result["text"].strip()
 
