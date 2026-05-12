@@ -1,4 +1,5 @@
-import os
+﻿import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -32,6 +33,231 @@ MSG_FFMPEG = (
     "Instale e adicione ao PATH: https://ffmpeg.org/download.html\n"
     "No Windows: baixe em https://www.gyan.dev/ffmpeg/builds/ e extraia a pasta 'bin' no PATH."
 )
+MSG_YT_DLP = "Para transcrever links do YouTube, instale: pip install yt-dlp"
+
+
+def _linha_e_url_youtube(linha: str) -> bool:
+    s = linha.strip()
+    if not s or s.startswith("#"):
+        return False
+    if not s.lower().startswith("http"):
+        return False
+    lower = s.lower()
+    return "youtube.com/" in lower or "youtu.be/" in lower
+
+
+def ler_urls_youtube_txt(caminho_txt: Path) -> list[str]:
+    """Lê um .txt: uma URL do YouTube por linha; linhas vazias e # comentários são ignoradas."""
+    if not caminho_txt.is_file():
+        raise FileNotFoundError(f"Arquivo não encontrado: {caminho_txt}")
+    conteudo = caminho_txt.read_text(encoding="utf-8", errors="replace")
+    urls: list[str] = []
+    for raw in conteudo.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if _linha_e_url_youtube(line):
+            primeira = line.split()[0]
+            urls.append(primeira)
+        else:
+            trecho = line if len(line) <= 120 else line[:117] + "..."
+            print(f"Aviso: linha ignorada (não parece URL do YouTube): {trecho}")
+    return urls
+
+
+def sanitizar_titulo_para_nome_ficheiro(titulo: str | None, fallback: str) -> str:
+    """Prepara o título do vídeo para usar como nome de ficheiro no Windows."""
+    t = (titulo or "").replace("\r", " ").replace("\n", " ").strip()
+    if not t:
+        t = fallback
+    # Caracteres inválidos em nomes de ficheiro no Windows
+    t = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", t)
+    t = re.sub(r"\s+", " ", t).strip(" .")
+    if len(t) > 180:
+        t = t[:180].rstrip(" .")
+    if not t:
+        t = fallback
+    return t
+
+
+def nome_base_txt_youtube(pasta: Path, titulo: str | None, video_id: str) -> str:
+    """
+    Nome do .txt sem extensão: título sanitizado; se já existir ficheiro, acrescenta [id].
+    """
+    vid = re.sub(r'[<>:"/\\|?*]', "_", str(video_id or "video"))
+    stem = sanitizar_titulo_para_nome_ficheiro(titulo, vid)
+    if not (pasta / f"{stem}.txt").exists():
+        return stem
+    stem2 = f"{stem} [{vid}]"
+    if len(stem2) > 200:
+        stem2 = stem2[:200].rstrip(" .")
+    n = 2
+    while (pasta / f"{stem2}.txt").exists():
+        stem2 = f"{stem} [{vid}] ({n})"
+        n += 1
+    return stem2
+
+
+def baixar_audio_youtube_mp3(url: str, pasta_destino: Path) -> tuple[Path, dict]:
+    """
+    Baixa o melhor áudio do vídeo, extrai para MP3 com FFmpeg.
+    Devolve (caminho_mp3, metadados) — o ficheiro continua nomeado pelo ID do vídeo
+    (estável para o yt-dlp); use o título em `metadados` para o nome da transcrição.
+    """
+    try:
+        import yt_dlp
+    except ImportError as e:
+        raise ImportError(MSG_YT_DLP) from e
+
+    pasta_destino = pasta_destino.resolve()
+    pasta_destino.mkdir(parents=True, exist_ok=True)
+    base = str(pasta_destino / "%(id)s")
+
+    opts: dict = {
+        "format": "bestaudio/best",
+        "outtmpl": base + ".%(ext)s",
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+        "noplaylist": True,
+        "quiet": False,
+        "no_warnings": False,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as e:
+        raise RuntimeError(f"Falha ao baixar áudio do YouTube: {e}") from e
+
+    video_id = (info or {}).get("id") or "audio"
+    # Remove caracteres inválidos no Windows (raro em IDs do YouTube).
+    video_id = re.sub(r'[<>:"/\\|?*]', "_", str(video_id))
+    caminho_mp3 = pasta_destino / f"{video_id}.mp3"
+    if not caminho_mp3.is_file():
+        raise RuntimeError(
+            f"O download terminou mas o MP3 não foi encontrado em: {caminho_mp3}\n"
+            "Confira se o FFmpeg está no PATH (o yt-dlp usa o FFmpeg para extrair o áudio)."
+        )
+    return caminho_mp3, info if isinstance(info, dict) else {}
+
+
+def transcrever_txt_youtube_links(
+    caminho_txt: Path,
+    saida_unica: str | None = None,
+) -> list[tuple[str, str]]:
+    """
+    Para cada URL em `caminho_txt` (mesma pasta = pasta de saída): baixa MP3, transcreve,
+    apaga o MP3 e grava `{título do vídeo}.txt` na mesma pasta (título sanitizado).
+    Se `saida_unica` for informado, não grava .txt por vídeo; junta tudo nesse arquivo ao final.
+    """
+    urls = ler_urls_youtube_txt(caminho_txt)
+    if not urls:
+        print(f"Nenhuma URL do YouTube encontrada em: {caminho_txt}")
+        return []
+
+    pasta = caminho_txt.parent.resolve()
+    print(f"Pasta de trabalho (áudio temporário e .txt): {pasta}")
+    print(f"Encontrada(s) {len(urls)} URL(s) do YouTube.")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Dispositivo: {'GPU (CUDA)' if device == 'cuda' else 'CPU'}")
+    print("Carregando modelo Whisper...")
+    model = whisper.load_model("turbo", device=device)
+
+    resultados: list[tuple[str, str]] = []
+    for i, url in enumerate(urls, 1):
+        print(f"\n[{i}/{len(urls)}] {url}")
+        mp3_path: Path | None = None
+        try:
+            print("Baixando áudio (MP3)...")
+            mp3_path, meta = baixar_audio_youtube_mp3(url, pasta)
+            print(f"Transcrevendo: {mp3_path.name}...")
+            texto = _transcrever_para_texto(str(mp3_path), model)
+            resultados.append((url, texto))
+            if saida_unica is None:
+                titulo = meta.get("title") or meta.get("fulltitle")
+                id_video = str(meta.get("id") or mp3_path.stem)
+                stem_txt = nome_base_txt_youtube(pasta, titulo if isinstance(titulo, str) else None, id_video)
+                saida_item = pasta / f"{stem_txt}.txt"
+                with open(saida_item, "w", encoding="utf-8") as f:
+                    f.write(texto)
+                print(f"Transcrição salva em: {saida_item}")
+        except (OSError, ValueError, ImportError, RuntimeError) as e:
+            print(f"Erro: {e}")
+        finally:
+            if mp3_path is not None and mp3_path.is_file():
+                mp3_path.unlink()
+                print(f"MP3 temporário removido: {mp3_path.name}")
+
+    if saida_unica and resultados:
+        path_saida = Path(saida_unica)
+        if path_saida.suffix.lower() != ".txt":
+            path_saida = path_saida.with_suffix(".txt")
+        path_saida.parent.mkdir(parents=True, exist_ok=True)
+        with open(path_saida, "w", encoding="utf-8") as f:
+            for url_item, texto in resultados:
+                f.write(f"--- {url_item} ---\n\n")
+                f.write(texto)
+                f.write("\n\n")
+        print(f"\nTranscrição única salva em: {path_saida}")
+    return resultados
+
+
+def transcrever_link_youtube_cli(
+    url: str,
+    pasta_trabalho: Path,
+    nome_saida: str | None = None,
+) -> str:
+    """
+    Uma única URL do YouTube: baixa MP3 em `pasta_trabalho`, transcreve, apaga o MP3 e grava o .txt.
+    Com `nome_saida` None, o ficheiro usa o título do vídeo (sanitizado) nessa pasta.
+    """
+    pasta_trabalho = pasta_trabalho.resolve()
+    pasta_trabalho.mkdir(parents=True, exist_ok=True)
+    print(f"Pasta de trabalho: {pasta_trabalho}")
+    print(url)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Dispositivo: {'GPU (CUDA)' if device == 'cuda' else 'CPU'}")
+    print("Carregando modelo Whisper...")
+    model = whisper.load_model("turbo", device=device)
+
+    mp3_path: Path | None = None
+    try:
+        print("Baixando áudio (MP3)...")
+        mp3_path, meta = baixar_audio_youtube_mp3(url, pasta_trabalho)
+        print(f"Transcrevendo: {mp3_path.name}...")
+        texto = _transcrever_para_texto(str(mp3_path), model)
+        if nome_saida is None:
+            titulo = meta.get("title") or meta.get("fulltitle")
+            id_video = str(meta.get("id") or mp3_path.stem)
+            stem_txt = nome_base_txt_youtube(
+                pasta_trabalho,
+                titulo if isinstance(titulo, str) else None,
+                id_video,
+            )
+            saida_path = pasta_trabalho / f"{stem_txt}.txt"
+        else:
+            p = Path(nome_saida).expanduser()
+            if p.is_absolute():
+                saida_path = p if p.suffix.lower() == ".txt" else p.with_suffix(".txt")
+            else:
+                nome = nome_saida if nome_saida.endswith(".txt") else f"{Path(nome_saida).stem}.txt"
+                saida_path = pasta_trabalho / nome
+        saida_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(saida_path, "w", encoding="utf-8") as f:
+            f.write(texto)
+        print(f"Transcrição salva em: {saida_path}")
+        return texto
+    finally:
+        if mp3_path is not None and mp3_path.is_file():
+            mp3_path.unlink()
+            print(f"MP3 temporário removido: {mp3_path.name}")
 
 
 def ffmpeg_disponivel() -> bool:
@@ -311,33 +537,80 @@ if __name__ == "__main__":
 
     inicio = time.perf_counter()
     try:
-        caminho = preparar_caminho_entrada(Path(entrada_raw).expanduser())
-
-        if caminho.is_dir():
+        entrada_norm = entrada_raw.strip()
+        token_yt = entrada_norm.split()[0] if entrada_norm else ""
+        if _linha_e_url_youtube(token_yt):
             if unico:
-                if segundo_arg:
-                    p = Path(segundo_arg)
-                    if p.is_absolute():
-                        out = p if p.suffix.lower() == ".txt" else p.with_suffix(".txt")
-                        saida_unica = str(out)
-                    else:
-                        nome_txt = (
-                            segundo_arg
-                            if segundo_arg.endswith(".txt")
-                            else f"{Path(segundo_arg).stem}.txt"
-                        )
-                        saida_unica = str(caminho / nome_txt)
-                else:
-                    saida_unica = str(caminho / "transcricao_completa.txt")
-            resultados = transcrever_pasta(str(caminho), saida_unica=saida_unica)
-            print(f"\n--- Concluído: {len(resultados)} arquivo(s) transcrito(s) ---")
-        else:
-            nome_saida = segundo_arg
-            if unico:
-                print("Aviso: --unico aplica-se apenas ao transcrever uma pasta; ignorado.")
-            texto = transcrever_e_salvar(str(caminho), nome_saida)
+                print(
+                    "Aviso: --unico com um único link do YouTube não altera o resultado; ignorado."
+                )
+            texto = transcrever_link_youtube_cli(
+                token_yt,
+                Path.cwd(),
+                nome_saida=segundo_arg,
+            )
             print("\n--- Transcrição ---")
             print(texto)
+        else:
+            caminho = preparar_caminho_entrada(Path(entrada_raw).expanduser())
+
+            if caminho.is_dir():
+                if unico:
+                    if segundo_arg:
+                        p = Path(segundo_arg)
+                        if p.is_absolute():
+                            out = p if p.suffix.lower() == ".txt" else p.with_suffix(".txt")
+                            saida_unica = str(out)
+                        else:
+                            nome_txt = (
+                                segundo_arg
+                                if segundo_arg.endswith(".txt")
+                                else f"{Path(segundo_arg).stem}.txt"
+                            )
+                            saida_unica = str(caminho / nome_txt)
+                    else:
+                        saida_unica = str(caminho / "transcricao_completa.txt")
+                resultados = transcrever_pasta(str(caminho), saida_unica=saida_unica)
+                print(f"\n--- Concluído: {len(resultados)} arquivo(s) transcrito(s) ---")
+            elif caminho.is_file() and caminho.suffix.lower() == ".txt":
+                urls_yt = ler_urls_youtube_txt(caminho)
+                if urls_yt:
+                    if unico:
+                        if segundo_arg:
+                            p = Path(segundo_arg)
+                            if p.is_absolute():
+                                out = p if p.suffix.lower() == ".txt" else p.with_suffix(".txt")
+                                saida_unica = str(out)
+                            else:
+                                nome_txt = (
+                                    segundo_arg
+                                    if segundo_arg.endswith(".txt")
+                                    else f"{Path(segundo_arg).stem}.txt"
+                                )
+                                saida_unica = str(caminho.parent / nome_txt)
+                        else:
+                            saida_unica = str(caminho.parent / "transcricao_completa.txt")
+                    elif segundo_arg:
+                        print(
+                            "Aviso: com lista de links do YouTube, o segundo argumento só é usado com --unico "
+                            "(nome do .txt de saída única)."
+                        )
+                    resultados = transcrever_txt_youtube_links(caminho, saida_unica=saida_unica)
+                    print(f"\n--- Concluído: {len(resultados)} vídeo(s) transcrito(s) ---")
+                else:
+                    nome_saida = segundo_arg
+                    if unico:
+                        print("Aviso: --unico aplica-se a pastas ou a .txt com URLs do YouTube; ignorado.")
+                    texto = transcrever_e_salvar(str(caminho), nome_saida)
+                    print("\n--- Transcrição ---")
+                    print(texto)
+            else:
+                nome_saida = segundo_arg
+                if unico:
+                    print("Aviso: --unico aplica-se a pastas ou a .txt com URLs do YouTube; ignorado.")
+                texto = transcrever_e_salvar(str(caminho), nome_saida)
+                print("\n--- Transcrição ---")
+                print(texto)
     except OSError as e:
         msg = str(e).lower()
         if (getattr(e, "winerror", None) == 2) or "não pode encontrar" in msg or "cannot find" in msg:
